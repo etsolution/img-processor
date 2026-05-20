@@ -659,14 +659,19 @@ class ResizeTool {
             height: document.getElementById('resizeHeight'),
             maintainAspect: document.getElementById('maintainAspect'),
             method: document.getElementById('resizeMethod'),
-            fitMethod: document.getElementById('fitMethod')
+            fitMethod: document.getElementById('fitMethod'),
+            unit: document.getElementById('resizeUnit'),
+            dpi: document.getElementById('resizeDpi'),
+            dpiRow: document.getElementById('resizeDpiRow'),
+            widthLabel: document.getElementById('resizeWidthLabel'),
+            heightLabel: document.getElementById('resizeHeightLabel')
         };
         
         this._bindEvents();
     }
 
     _bindEvents() {
-        const { toggle, width, height, method, fitMethod } = this.elements;
+        const { toggle, width, height, method, fitMethod, unit, dpi } = this.elements;
         const debouncedProcess = Utils.debounce(() => this.processor.process(), 300);
 
         toggle.addEventListener('change', () => {
@@ -691,6 +696,48 @@ class ResizeTool {
         fitMethod.addEventListener('change', () => {
             if (this.enabled) debouncedProcess();
         });
+
+        unit.addEventListener('change', () => {
+            this._onUnitChange();
+            if (this.enabled) debouncedProcess();
+        });
+
+        dpi.addEventListener('input', () => {
+            if (this.enabled) debouncedProcess();
+        });
+    }
+
+    _mmToPx(mm) {
+        const dpi = parseFloat(this.elements.dpi.value) || 150;
+        return Math.round(mm * dpi / 25.4);
+    }
+
+    _pxToMm(px) {
+        const dpi = parseFloat(this.elements.dpi.value) || 150;
+        return parseFloat((px * 25.4 / dpi).toFixed(2));
+    }
+
+    _onUnitChange() {
+        const isMm = this.elements.unit.value === 'mm';
+        if (isMm) {
+            this.elements.dpiRow.classList.remove('hidden');
+            this.elements.widthLabel.textContent = 'Width (mm)';
+            this.elements.heightLabel.textContent = 'Height (mm)';
+            // convert current px values to mm
+            const wPx = parseInt(this.elements.width.value);
+            const hPx = parseInt(this.elements.height.value);
+            if (wPx) this.elements.width.value = this._pxToMm(wPx);
+            if (hPx) this.elements.height.value = this._pxToMm(hPx);
+        } else {
+            this.elements.dpiRow.classList.add('hidden');
+            this.elements.widthLabel.textContent = 'Width (px)';
+            this.elements.heightLabel.textContent = 'Height (px)';
+            // convert current mm values back to px
+            const wMm = parseFloat(this.elements.width.value);
+            const hMm = parseFloat(this.elements.height.value);
+            if (wMm) this.elements.width.value = this._mmToPx(wMm);
+            if (hMm) this.elements.height.value = this._mmToPx(hMm);
+        }
     }
 
     _onToggle() {
@@ -704,20 +751,31 @@ class ResizeTool {
 
     _onWidthChange() {
         if (this.elements.maintainAspect.checked && this.processor.aspectRatio) {
-            this.elements.height.value = Math.round(this.elements.width.value / this.processor.aspectRatio);
+            const isMm = this.elements.unit.value === 'mm';
+            const w = parseFloat(this.elements.width.value);
+            const newH = w / this.processor.aspectRatio;
+            this.elements.height.value = isMm ? parseFloat(newH.toFixed(2)) : Math.round(newH);
         }
     }
 
     _onHeightChange() {
         if (this.elements.maintainAspect.checked && this.processor.aspectRatio) {
-            this.elements.width.value = Math.round(this.elements.height.value * this.processor.aspectRatio);
+            const isMm = this.elements.unit.value === 'mm';
+            const h = parseFloat(this.elements.height.value);
+            const newW = h * this.processor.aspectRatio;
+            this.elements.width.value = isMm ? parseFloat(newW.toFixed(2)) : Math.round(newW);
         }
     }
 
     getOptions() {
+        const isMm = this.elements.unit.value === 'mm';
+        const wVal = parseFloat(this.elements.width.value);
+        const hVal = parseFloat(this.elements.height.value);
+        const width = isMm ? (wVal ? this._mmToPx(wVal) : this.processor.width) : (parseInt(wVal) || this.processor.width);
+        const height = isMm ? (hVal ? this._mmToPx(hVal) : this.processor.height) : (parseInt(hVal) || this.processor.height);
         return {
-            width: parseInt(this.elements.width.value) || this.processor.width,
-            height: parseInt(this.elements.height.value) || this.processor.height,
+            width,
+            height,
             method: this.elements.method.value,
             fitMethod: this.elements.fitMethod.value,
             premultiply: true,
@@ -889,6 +947,123 @@ class CompressTool {
 // ImageProcessor Main Class
 // ============================================================================
 
+class TransformerBgTool {
+    constructor(processor) {
+        this.processor = processor;
+        this.enabled = false;
+        this.segmentFn = null;
+        this.applyBgFn = null;
+        this.cachedSegmented = null; // transparent ImageData, cleared on new image only
+
+        this.elements = {
+            toggle: document.getElementById('enableRemoveBg'),
+            options: document.getElementById('removeBgOptions'),
+            color: document.getElementById('removeBgColor'),
+            customRow: document.getElementById('removeBgCustomRow'),
+            customInput: document.getElementById('removeBgCustomInput')
+        };
+
+        this._bindEvents();
+        this._loadModule();
+    }
+
+    async _loadModule() {
+        try {
+            const mod = await import('./transformal/transformal.js');
+            this.segmentFn = mod.segmentImage;
+            this.applyBgFn = mod.applyBackground;
+        } catch (e) {
+            console.error('Failed to load transformal module:', e);
+        }
+    }
+
+    clearCache() {
+        this.cachedSegmented = null;
+    }
+
+    _isCached() {
+        return localStorage.getItem('imgly_bg_model_cached') === '1';
+    }
+
+    _markCached() {
+        localStorage.setItem('imgly_bg_model_cached', '1');
+    }
+
+    _bindEvents() {
+        const debouncedProcess = Utils.debounce(() => this.processor.process(), 300);
+
+        this.elements.toggle.addEventListener('change', () => {
+            if (this.elements.toggle.checked && !this._isCached()) {
+                const confirmed = confirm(
+                    'Remove Background requires downloading an AI model (~200 MB).\n\n' +
+                    'This only happens once — the model will be cached in your browser.\n\n' +
+                    'Continue?'
+                );
+                if (!confirmed) {
+                    this.elements.toggle.checked = false;
+                    return;
+                }
+            }
+            this._onToggle();
+            debouncedProcess();
+        });
+
+        this.elements.color.addEventListener('change', () => {
+            this.elements.customRow.classList.toggle('hidden', this.elements.color.value !== 'custom');
+            if (this.enabled) debouncedProcess();
+        });
+
+        this.elements.customInput.addEventListener('input', () => {
+            if (this.enabled) debouncedProcess();
+        });
+    }
+
+    _onToggle() {
+        this.enabled = this.elements.toggle.checked;
+        if (this.enabled) {
+            this.elements.options.classList.remove('opacity-50', 'pointer-events-none');
+        } else {
+            this.elements.options.classList.add('opacity-50', 'pointer-events-none');
+        }
+    }
+
+    getColor() {
+        const val = this.elements.color.value;
+        return val === 'custom' ? this.elements.customInput.value : val;
+    }
+
+    async process(imageData) {
+        if (!this.segmentFn || !this.applyBgFn) {
+            await this._loadModule();
+            if (!this.segmentFn) throw new Error('Transformal module failed to load');
+        }
+        // Run AI only if no cached result for this image
+        if (!this.cachedSegmented) {
+            this.cachedSegmented = await this.segmentFn(
+                imageData,
+                (msg) => this.processor.showLoading(msg, 30)
+            );
+            this._markCached();
+        }
+        // Fast — just re-composite cached transparent image onto chosen color
+        return this.applyBgFn(this.cachedSegmented, this.getColor());
+    }
+
+    reset() {
+        this.enabled = false;
+        this.elements.toggle.checked = false;
+        this.elements.options.classList.add('opacity-50', 'pointer-events-none');
+    }
+
+    syncUIState() {
+        if (this.elements.toggle.checked) {
+            this.elements.options.classList.remove('opacity-50', 'pointer-events-none');
+        } else {
+            this.elements.options.classList.add('opacity-50', 'pointer-events-none');
+        }
+    }
+}
+
 class ImageProcessor {
     constructor() {
         this.originalFile = null;
@@ -927,6 +1102,7 @@ class ImageProcessor {
         this.zoomTool = new ZoomTool(this);
         this.cropTool = new CropTool(this);
         this.resizeTool = new ResizeTool(this);
+        this.transformerBgTool = new TransformerBgTool(this);
         this.compressTool = new CompressTool(this);
 
         this._bindEvents();
@@ -992,6 +1168,7 @@ class ImageProcessor {
         this.zoomTool.syncUIState();
         this.cropTool.syncUIState();
         this.resizeTool.syncUIState();
+        this.transformerBgTool.syncUIState();
         this.compressTool.syncUIState();
     }
 
@@ -1032,8 +1209,12 @@ class ImageProcessor {
             this.elements.originalType.textContent = file.type;
 
             // Set resize defaults
-            this.resizeTool.elements.width.value = this.width;
-            this.resizeTool.elements.height.value = this.height;
+            const isMm = this.resizeTool.elements.unit.value === 'mm';
+            this.resizeTool.elements.width.value = isMm ? this.resizeTool._pxToMm(this.width) : this.width;
+            this.resizeTool.elements.height.value = isMm ? this.resizeTool._pxToMm(this.height) : this.height;
+
+            // Clear bg cache so AI re-runs on the new image
+            this.transformerBgTool.clearCache();
 
             // Show preview
             const blob = new Blob([arrayBuffer], { type: file.type });
@@ -1059,6 +1240,11 @@ class ImageProcessor {
 
         try {
             let imageData = this.imageData;
+
+            // Remove background if enabled
+            if (this.transformerBgTool.enabled) {
+                imageData = await this.transformerBgTool.process(imageData);
+            }
 
             // Resize if enabled
             if (this.resizeTool.enabled && this.resizeModule) {
@@ -1142,6 +1328,7 @@ class ImageProcessor {
         this.zoomTool.reset();
         this.cropTool.reset();
         this.resizeTool.reset();
+        this.transformerBgTool.reset();
         this.compressTool.reset();
     }
 }
